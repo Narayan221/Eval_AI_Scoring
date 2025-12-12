@@ -78,6 +78,9 @@ class SessionScorer:
         # Movement analysis
         movement_score = self._calculate_movement(results)
         
+        # Count persons detected
+        person_count = self._count_persons(results)
+        
         return {
             "timestamp": timestamp,
             "attention": attention,
@@ -86,7 +89,8 @@ class SessionScorer:
             "engagement": engagement,
             "movement_stability": movement_score,
             "head_orientation": self._calculate_head_orientation(results),
-            "eye_contact_quality": self._calculate_eye_contact(frame)
+            "eye_contact_quality": self._calculate_eye_contact(frame),
+            "person_count": person_count
         }
     
     def _calculate_enhanced_attention(self, frame, results) -> float:
@@ -117,7 +121,12 @@ class SessionScorer:
         if not results[0].boxes or len(results[0].boxes.data) == 0:
             return 0.0
         
-        max_confidence = max([box[4].item() for box in results[0].boxes.data])
+        # Filter for person detections only (class 0)
+        person_boxes = [box for box in results[0].boxes.data if box[5] == 0]
+        if not person_boxes:
+            return 0.0
+            
+        max_confidence = max([box[4].item() for box in person_boxes])
         return min(100, max_confidence * 100)
     
     def _calculate_enhanced_posture(self, results) -> float:
@@ -293,7 +302,8 @@ class SessionScorer:
             face_ratio = face_area / frame_area
             
             eye_contact_score = min(1.0, face_ratio * 25)  # Increased multiplier for smaller frame
-            return max(40.0, eye_contact_score * 100)
+            final_score = eye_contact_score * 100
+            return max(40.0, min(100.0, final_score))  # Cap at 100
         except:
             return 40.0
     
@@ -321,6 +331,14 @@ class SessionScorer:
         except:
             return 0.7
     
+    def _count_persons(self, results) -> int:
+        if not results[0].boxes or len(results[0].boxes.data) == 0:
+            return 0
+        
+        # Count person detections (class 0)
+        person_count = sum(1 for box in results[0].boxes.data if box[5] == 0)
+        return person_count
+    
     def _calculate_scores(self, metrics: List[Dict]) -> Dict:
         if not metrics:
             return {"error": "No frames analyzed"}
@@ -333,10 +351,25 @@ class SessionScorer:
         avg_movement = np.mean([m["movement_stability"] for m in metrics])
         avg_eye_contact = np.mean([m["eye_contact_quality"] for m in metrics])
         
-        # Enhanced overall score calculation
-        overall_score = (avg_attention * 0.25 + avg_confidence * 0.15 + 
-                        avg_posture * 0.2 + avg_engagement * 0.2 + 
-                        avg_movement * 0.1 + avg_eye_contact * 0.1)
+        # Person count analysis
+        person_counts = [m["person_count"] for m in metrics]
+        avg_person_count = np.mean(person_counts)
+        single_person_frames = sum(1 for count in person_counts if count == 1)
+        multi_person_frames = sum(1 for count in person_counts if count > 1)
+        no_person_frames = sum(1 for count in person_counts if count == 0)
+        
+        # Adjust scores based on person presence
+        presence_penalty = 1.0
+        if avg_person_count == 0:
+            presence_penalty = 0.3  # Heavy penalty for no person detected
+        elif avg_person_count > 1.5:
+            presence_penalty = 0.8  # Slight penalty for multiple people
+        
+        # Enhanced overall score calculation with presence penalty
+        base_score = (avg_attention * 0.25 + avg_confidence * 0.15 + 
+                     avg_posture * 0.2 + avg_engagement * 0.2 + 
+                     avg_movement * 0.1 + avg_eye_contact * 0.1)
+        overall_score = base_score * presence_penalty
         
         return {
             "session_analysis": {
@@ -349,9 +382,30 @@ class SessionScorer:
                 "overall_score": round(overall_score, 2)
             },
             "enhanced_metrics": {
-                "head_orientations": [m["head_orientation"] for m in metrics],
-                "movement_patterns": [m["movement_stability"] for m in metrics],
-                "eye_contact_timeline": [m["eye_contact_quality"] for m in metrics]
+                "movement_analysis": {
+                    "average_stability": round(avg_movement, 2),
+                    "high_movement_frames": sum(1 for m in metrics if m["movement_stability"] < 70),
+                    "stable_frames": sum(1 for m in metrics if m["movement_stability"] > 90),
+                    "detection_failures": sum(1 for m in metrics if m["movement_stability"] == 0 or m["movement_stability"] == 50)
+                },
+                "eye_contact_analysis": {
+                    "average_quality": round(avg_eye_contact, 2),
+                    "good_contact_frames": sum(1 for m in metrics if m["eye_contact_quality"] > 80),
+                    "poor_contact_frames": sum(1 for m in metrics if m["eye_contact_quality"] <= 40),
+                    "face_detection_rate": round((sum(1 for m in metrics if m["eye_contact_quality"] > 40) / len(metrics)) * 100, 2)
+                },
+                "head_orientation_summary": {
+                    "average_pitch": round(np.mean([m["head_orientation"]["pitch"] for m in metrics]), 2),
+                    "average_yaw": round(np.mean([m["head_orientation"]["yaw"] for m in metrics]), 2),
+                    "average_roll": round(np.mean([m["head_orientation"]["roll"] for m in metrics]), 2)
+                }
+            },
+            "person_analysis": {
+                "average_person_count": round(avg_person_count, 2),
+                "single_person_frames": single_person_frames,
+                "multi_person_frames": multi_person_frames,
+                "no_person_frames": no_person_frames,
+                "presence_penalty_applied": round(presence_penalty, 2)
             },
             "frame_by_frame_data": metrics,
             "scoring_formula": self.get_formula_info()["formula"]
@@ -369,12 +423,21 @@ class SessionScorer:
                 "eye_contact_quality": "Eye openness and gaze direction quality (0-100)"
             },
             "weights": {
-                "attention": 0.25,
-                "confidence": 0.15,
-                "posture": 0.2,
-                "engagement": 0.2,
-                "movement_stability": 0.1,
-                "eye_contact_quality": 0.1
+                "attention": "25% (0.25) - Most Important",
+                "confidence": "15% (0.15) - Moderate Impact",
+                "posture": "20% (0.20) - High Impact",
+                "engagement": "20% (0.20) - High Impact",
+                "movement_stability": "10% (0.10) - Low Impact",
+                "eye_contact_quality": "10% (0.10) - Low Impact"
+            },
+            "score_ranges": {
+                "all_metrics": "0-100 (Higher is better)",
+                "overall_score": "0-100 (Weighted average with presence penalty)",
+                "excellent": "90-100",
+                "good": "70-89",
+                "average": "50-69",
+                "poor": "30-49",
+                "very_poor": "0-29"
             },
             "enhanced_features": [
                 "Eye gaze tracking",
