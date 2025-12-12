@@ -32,8 +32,8 @@ class SessionScorer:
             metrics = []
             frame_idx = 0
             
-            # Process every 2nd frame for better accuracy while maintaining speed
-            sample_rate = 2
+            # Process every 5th frame for maximum speed
+            sample_rate = 5
             
             while cap.read()[0]:
                 ret, frame = cap.read()
@@ -58,25 +58,26 @@ class SessionScorer:
                 pass  # Ignore Windows file lock issues
     
     def _analyze_frame(self, frame: np.ndarray, timestamp: float) -> Dict:
-        # Resize frame for faster processing
-        height, width = frame.shape[:2]
-        if width > 640:  # Resize if too large
-            scale = 640 / width
-            new_width = 640
-            new_height = int(height * scale)
-            frame = cv2.resize(frame, (new_width, new_height))
+        # Aggressive resize for speed
+        frame = cv2.resize(frame, (416, 416))  # Fixed small size for YOLO
         
-        # YOLO pose detection with optimized settings
-        results = self.yolo_model(frame, verbose=False, imgsz=640)
+        # YOLO pose detection with maximum speed settings
+        results = self.yolo_model(frame, verbose=False, imgsz=416)
         
-        # Enhanced metrics
-        attention = self._calculate_enhanced_attention(frame, results)
+        # Simplified metrics for speed
         confidence = self._calculate_confidence(results)
         posture = self._calculate_enhanced_posture(results)
-        engagement = self._calculate_enhanced_engagement(frame, results)
-        
-        # Movement analysis
         movement_score = self._calculate_movement(results)
+        
+        # Skip expensive face detection every frame
+        if frame_idx % 10 == 0:  # Only every 10th processed frame
+            attention = self._calculate_enhanced_attention(frame, results)
+            engagement = self._calculate_enhanced_engagement(frame, results)
+            eye_contact = self._calculate_eye_contact(frame)
+        else:
+            attention = 60.0  # Default values
+            engagement = 70.0
+            eye_contact = 50.0
         
         # Count persons detected
         person_count = self._count_persons(results)
@@ -89,7 +90,7 @@ class SessionScorer:
             "engagement": engagement,
             "movement_stability": movement_score,
             "head_orientation": self._calculate_head_orientation(results),
-            "eye_contact_quality": self._calculate_eye_contact(frame),
+            "eye_contact_quality": eye_contact,
             "person_count": person_count
         }
     
@@ -200,8 +201,8 @@ class SessionScorer:
         x, y, w, h = face
         
         # Scale back to original frame
-        scale_x = frame.shape[1] / 320
-        scale_y = frame.shape[0] / 240
+        scale_x = frame.shape[1] / 160
+        scale_y = frame.shape[0] / 120
         
         # Face center position (scaled back)
         face_center_x = (x + w // 2) * scale_x
@@ -284,10 +285,10 @@ class SessionScorer:
     
     def _calculate_eye_contact(self, frame) -> float:
         try:
-            # Use smaller frame for speed
-            small_frame = cv2.resize(frame, (320, 240))
+            # Ultra small frame for maximum speed
+            small_frame = cv2.resize(frame, (160, 120))
             gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-            faces = self.face_cascade.detectMultiScale(gray, 1.3, 3, minSize=(20, 20))
+            faces = self.face_cascade.detectMultiScale(gray, 1.5, 2, minSize=(15, 15))
             
             if len(faces) == 0:
                 return 40.0  # Higher default score
@@ -309,10 +310,10 @@ class SessionScorer:
     
     def _calculate_facial_engagement(self, frame) -> float:
         try:
-            # Use smaller frame for speed
-            small_frame = cv2.resize(frame, (320, 240))
+            # Ultra small frame for maximum speed
+            small_frame = cv2.resize(frame, (160, 120))
             gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-            faces = self.face_cascade.detectMultiScale(gray, 1.3, 3, minSize=(20, 20))
+            faces = self.face_cascade.detectMultiScale(gray, 1.5, 2, minSize=(15, 15))
             
             if len(faces) == 0:
                 return 0.7  # Higher default engagement
