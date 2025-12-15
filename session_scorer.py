@@ -5,11 +5,35 @@ import tempfile
 import os
 from typing import Dict, List
 import math
+import whisper
+import ffmpeg
 
 class SessionScorer:
     def __init__(self):
+        # Force NVIDIA GPU specifically
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available! NVIDIA GPU required.")
+        
+        # Find NVIDIA GPU (skip Intel GPU at index 0)
+        nvidia_device = 0
+        if torch.cuda.device_count() > 1:
+            for i in range(torch.cuda.device_count()):
+                gpu_name = torch.cuda.get_device_name(i).lower()
+                if 'nvidia' in gpu_name or 'geforce' in gpu_name or 'rtx' in gpu_name or 'gtx' in gpu_name:
+                    nvidia_device = i
+                    break
+        
+        print(f"Using GPU {nvidia_device}: {torch.cuda.get_device_name(nvidia_device)}")
+        torch.cuda.set_device(nvidia_device)
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(nvidia_device)
+        
+        # Store device for monitoring
+        self.device = f'cuda:{nvidia_device}'
+        self.torch = torch
+        
         self.yolo_model = YOLO('yolov8n-pose.pt')
-        self.yolo_model.to('cuda')  # GPU only
+        self.yolo_model.to(f'cuda:{nvidia_device}')
         
         # Optimize YOLO for speed while maintaining accuracy
         self.yolo_model.conf = 0.25  # Slightly higher confidence for better accuracy
@@ -18,6 +42,9 @@ class SessionScorer:
         
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         self.previous_positions = []  # For movement tracking
+        
+        # Force Whisper to use NVIDIA GPU specifically
+        self.whisper_model = whisper.load_model("large-v3", device=f"cuda:{nvidia_device}")
         
     def analyze_video(self, video_bytes: bytes) -> Dict:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
@@ -43,13 +70,21 @@ class SessionScorer:
                 # Skip frames for faster processing
                 if frame_idx % sample_rate == 0:
                     timestamp = frame_idx / fps
-                    frame_metrics = self._analyze_frame(frame, timestamp)
+                    frame_metrics = self._analyze_frame(frame, timestamp, frame_idx)
                     metrics.append(frame_metrics)
                     
                 frame_idx += 1
                 
             cap.release()
-            return self._calculate_scores(metrics)
+            
+            # Extract and transcribe audio
+            transcription = self._transcribe_audio(tmp_path)
+            
+            # Combine video analysis with transcription
+            results = self._calculate_scores(metrics)
+            results["audio_transcription"] = transcription
+            
+            return results
             
         finally:
             try:
@@ -57,7 +92,12 @@ class SessionScorer:
             except PermissionError:
                 pass  # Ignore Windows file lock issues
     
-    def _analyze_frame(self, frame: np.ndarray, timestamp: float) -> Dict:
+    def _analyze_frame(self, frame: np.ndarray, timestamp: float, frame_idx: int) -> Dict:
+        # Monitor GPU usage
+        if frame_idx % 50 == 0:  # Every 50 frames
+            gpu_memory = self.torch.cuda.memory_allocated(self.device) / 1024**3
+            print(f"Frame {frame_idx}: GPU Memory: {gpu_memory:.2f}GB")
+        
         # Aggressive resize for speed
         frame = cv2.resize(frame, (416, 416))  # Fixed small size for YOLO
         
@@ -340,6 +380,47 @@ class SessionScorer:
         person_count = sum(1 for box in results[0].boxes.data if box[5] == 0)
         return person_count
     
+    def _transcribe_audio(self, video_path: str) -> Dict:
+        try:
+            # Extract audio from video
+            audio_path = video_path.replace('.mp4', '.wav')
+            (
+                ffmpeg
+                .input(video_path)
+                .output(audio_path, acodec='pcm_s16le', ac=1, ar='16000')
+                .overwrite_output()
+                .run(quiet=True)
+            )
+            
+            # Transcribe with Whisper
+            result = self.whisper_model.transcribe(audio_path)
+            
+            # Clean up audio file
+            try:
+                os.unlink(audio_path)
+            except:
+                pass
+            
+            return {
+                "text": result["text"].strip(),
+                "language": result["language"],
+                "segments": [
+                    {
+                        "start": seg["start"],
+                        "end": seg["end"],
+                        "text": seg["text"].strip()
+                    }
+                    for seg in result["segments"]
+                ]
+            }
+        except Exception as e:
+            return {
+                "text": "",
+                "language": "unknown",
+                "segments": [],
+                "error": str(e)
+            }
+    
     def _calculate_scores(self, metrics: List[Dict]) -> Dict:
         if not metrics:
             return {"error": "No frames analyzed"}
@@ -382,33 +463,6 @@ class SessionScorer:
                 "eye_contact_quality_score": round(avg_eye_contact, 2),
                 "overall_score": round(overall_score, 2)
             },
-            "enhanced_metrics": {
-                "movement_analysis": {
-                    "average_stability": round(avg_movement, 2),
-                    "high_movement_frames": sum(1 for m in metrics if m["movement_stability"] < 70),
-                    "stable_frames": sum(1 for m in metrics if m["movement_stability"] > 90),
-                    "detection_failures": sum(1 for m in metrics if m["movement_stability"] == 0 or m["movement_stability"] == 50)
-                },
-                "eye_contact_analysis": {
-                    "average_quality": round(avg_eye_contact, 2),
-                    "good_contact_frames": sum(1 for m in metrics if m["eye_contact_quality"] > 80),
-                    "poor_contact_frames": sum(1 for m in metrics if m["eye_contact_quality"] <= 40),
-                    "face_detection_rate": round((sum(1 for m in metrics if m["eye_contact_quality"] > 40) / len(metrics)) * 100, 2)
-                },
-                "head_orientation_summary": {
-                    "average_pitch": round(np.mean([m["head_orientation"]["pitch"] for m in metrics]), 2),
-                    "average_yaw": round(np.mean([m["head_orientation"]["yaw"] for m in metrics]), 2),
-                    "average_roll": round(np.mean([m["head_orientation"]["roll"] for m in metrics]), 2)
-                }
-            },
-            "person_analysis": {
-                "average_person_count": round(avg_person_count, 2),
-                "single_person_frames": single_person_frames,
-                "multi_person_frames": multi_person_frames,
-                "no_person_frames": no_person_frames,
-                "presence_penalty_applied": round(presence_penalty, 2)
-            },
-            "frame_by_frame_data": metrics,
             "scoring_formula": self.get_formula_info()["formula"]
         }
     
