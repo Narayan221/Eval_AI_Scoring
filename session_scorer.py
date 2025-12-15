@@ -5,8 +5,10 @@ import tempfile
 import os
 from typing import Dict, List
 import math
-import whisper
+from faster_whisper import WhisperModel
 import ffmpeg
+import concurrent.futures
+import time
 
 class SessionScorer:
     def __init__(self):
@@ -44,41 +46,32 @@ class SessionScorer:
         self.previous_positions = []  # For movement tracking
         
         # Force Whisper to use NVIDIA GPU specifically
-        self.whisper_model = whisper.load_model("large-v3", device=f"cuda:{nvidia_device}")
+        # Use float16 to maintain original quality
+        print("Loading Faster-Whisper model...")
+        self.whisper_model = WhisperModel("large-v3", device="cuda", device_index=nvidia_device, compute_type="float16")
         
+    
     def analyze_video(self, video_bytes: bytes) -> Dict:
         with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
             tmp_file.write(video_bytes)
             tmp_path = tmp_file.name
             
         try:
-            cap = cv2.VideoCapture(tmp_path)
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            # 1. Start Audio Extraction & Transcription in Background
+            # Extract audio first so transcription can run parallel to video analysis
+            audio_path = tmp_path.replace('.mp4', '.wav')
+            self._extract_audio(tmp_path, audio_path)
             
-            metrics = []
-            frame_idx = 0
-            
-            # Process every 5th frame for maximum speed
-            sample_rate = 5
-            
-            while cap.read()[0]:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                    
-                # Skip frames for faster processing
-                if frame_idx % sample_rate == 0:
-                    timestamp = frame_idx / fps
-                    frame_metrics = self._analyze_frame(frame, timestamp, frame_idx)
-                    metrics.append(frame_metrics)
-                    
-                frame_idx += 1
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                # Start transcription immediately
+                transcription_future = executor.submit(self._transcribe_audio_file, audio_path)
                 
-            cap.release()
-            
-            # Extract and transcribe audio
-            transcription = self._transcribe_audio(tmp_path)
+                # 2. Run Video Analysis (Main Thread)
+                # Video analysis is heavier on CPU/CV logic, so keep it in main thread
+                metrics = self._analyze_video_frames_batched(tmp_path)
+                
+                # 3. Wait for Transcription
+                transcription = transcription_future.result()
             
             # Combine video analysis with transcription
             results = self._calculate_scores(metrics)
@@ -89,50 +82,124 @@ class SessionScorer:
         finally:
             try:
                 os.unlink(tmp_path)
+                if os.path.exists(audio_path):
+                    os.unlink(audio_path)
             except PermissionError:
                 pass  # Ignore Windows file lock issues
+
+    def _extract_audio(self, video_path: str, audio_path: str):
+        try:
+            (
+                ffmpeg
+                .input(video_path)
+                .output(audio_path, acodec='pcm_s16le', ac=1, ar='16000')
+                .overwrite_output()
+                .run(quiet=True)
+            )
+        except Exception as e:
+            print(f"Error extracting audio: {e}")
+
+    def _analyze_video_frames_batched(self, video_path: str) -> List[Dict]:
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        metrics = []
+        frame_idx = 0
+        
+        # Process every 5th frame
+        sample_rate = 5
+        batch_size = 16  # YOLO batch size
+        
+        batch_frames = []
+        batch_indices = []
+        batch_timestamps = []
+        
+        while cap.read()[0]:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # Skip frames
+            if frame_idx % sample_rate == 0:
+                # Add to batch
+                timestamp = frame_idx / fps
+                
+                # Pre-process frame for YOLO (resize)
+                # Note: YOLOv8 handles resizing internally but pre-resizing 
+                # saves PCIe bandwidth if frames are 4K
+                processed_frame = cv2.resize(frame, (416, 416))
+                
+                batch_frames.append(processed_frame)
+                batch_indices.append(frame_idx)
+                batch_timestamps.append(timestamp)
+                
+                # Process batch if full
+                if len(batch_frames) >= batch_size:
+                    batch_metrics = self._process_batch(batch_frames, batch_indices, batch_timestamps)
+                    metrics.extend(batch_metrics)
+                    
+                    # Reset batch
+                    batch_frames = []
+                    batch_indices = []
+                    batch_timestamps = []
+                
+            frame_idx += 1
+            
+        # Process remaining frames
+        if batch_frames:
+            batch_metrics = self._process_batch(batch_frames, batch_indices, batch_timestamps)
+            metrics.extend(batch_metrics)
+            
+        cap.release()
+        return metrics
+
+    def _process_batch(self, frames: List[np.ndarray], indices: List[int], timestamps: List[float]) -> List[Dict]:
+        # Run YOLO on batch
+        # verbose=False, imgsz=416 are default but explicit is good
+        results_list = self.yolo_model(frames, verbose=False, imgsz=416)
+        
+        batch_results = []
+        
+        for i, results in enumerate(results_list):
+            frame = frames[i]
+            frame_idx = indices[i]
+            timestamp = timestamps[i]
+            
+            # Simple metrics
+            confidence = self._calculate_confidence([results]) # Helper expects list
+            posture = self._calculate_enhanced_posture([results])
+            movement_score = self._calculate_movement([results])
+            
+            # Expensive CV ops - only occasionally
+            if frame_idx % 10 == 0:
+                attention = self._calculate_enhanced_attention(frame, [results])
+                engagement = self._calculate_enhanced_engagement(frame, [results])
+                eye_contact = self._calculate_eye_contact(frame)
+            else:
+                attention = 60.0
+                engagement = 70.0
+                eye_contact = 50.0
+            
+            # Count persons
+            person_count = self._count_persons([results])
+            
+            batch_results.append({
+                "timestamp": timestamp,
+                "attention": attention,
+                "confidence": confidence,
+                "posture": posture,
+                "engagement": engagement,
+                "movement_stability": movement_score,
+                "head_orientation": self._calculate_head_orientation([results]),
+                "eye_contact_quality": eye_contact,
+                "person_count": person_count
+            })
+            
+        return batch_results
+
     
-    def _analyze_frame(self, frame: np.ndarray, timestamp: float, frame_idx: int) -> Dict:
-        # Monitor GPU usage
-        if frame_idx % 50 == 0:  # Every 50 frames
-            gpu_memory = self.torch.cuda.memory_allocated(self.device) / 1024**3
-            print(f"Frame {frame_idx}: GPU Memory: {gpu_memory:.2f}GB")
-        
-        # Aggressive resize for speed
-        frame = cv2.resize(frame, (416, 416))  # Fixed small size for YOLO
-        
-        # YOLO pose detection with maximum speed settings
-        results = self.yolo_model(frame, verbose=False, imgsz=416)
-        
-        # Simplified metrics for speed
-        confidence = self._calculate_confidence(results)
-        posture = self._calculate_enhanced_posture(results)
-        movement_score = self._calculate_movement(results)
-        
-        # Skip expensive face detection every frame
-        if frame_idx % 10 == 0:  # Only every 10th processed frame
-            attention = self._calculate_enhanced_attention(frame, results)
-            engagement = self._calculate_enhanced_engagement(frame, results)
-            eye_contact = self._calculate_eye_contact(frame)
-        else:
-            attention = 60.0  # Default values
-            engagement = 70.0
-            eye_contact = 50.0
-        
-        # Count persons detected
-        person_count = self._count_persons(results)
-        
-        return {
-            "timestamp": timestamp,
-            "attention": attention,
-            "confidence": confidence,
-            "posture": posture,
-            "engagement": engagement,
-            "movement_stability": movement_score,
-            "head_orientation": self._calculate_head_orientation(results),
-            "eye_contact_quality": eye_contact,
-            "person_count": person_count
-        }
+
     
     def _calculate_enhanced_attention(self, frame, results) -> float:
         if not results[0].keypoints or len(results[0].keypoints.data) == 0:
@@ -380,40 +447,31 @@ class SessionScorer:
         person_count = sum(1 for box in results[0].boxes.data if box[5] == 0)
         return person_count
     
-    def _transcribe_audio(self, video_path: str) -> Dict:
+    def _transcribe_audio_file(self, audio_path: str) -> Dict:
         try:
-            # Extract audio from video
-            audio_path = video_path.replace('.mp4', '.wav')
-            (
-                ffmpeg
-                .input(video_path)
-                .output(audio_path, acodec='pcm_s16le', ac=1, ar='16000')
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            # Transcribe with Faster-Whisper
+            # Returns a generator
+            segments, info = self.whisper_model.transcribe(audio_path, beam_size=5)
             
-            # Transcribe with Whisper
-            result = self.whisper_model.transcribe(audio_path)
+            # Convert generator to list immediately
+            segment_list = list(segments)
             
-            # Clean up audio file
-            try:
-                os.unlink(audio_path)
-            except:
-                pass
+            full_text = " ".join([seg.text.strip() for seg in segment_list])
             
             return {
-                "text": result["text"].strip(),
-                "language": result["language"],
+                "text": full_text,
+                "language": info.language,
                 "segments": [
                     {
-                        "start": seg["start"],
-                        "end": seg["end"],
-                        "text": seg["text"].strip()
+                        "start": seg.start,
+                        "end": seg.end,
+                        "text": seg.text.strip()
                     }
-                    for seg in result["segments"]
+                    for seg in segment_list
                 ]
             }
         except Exception as e:
+            print(f"Transcription error: {e}")
             return {
                 "text": "",
                 "language": "unknown",
